@@ -3,17 +3,17 @@
 
 
 ## Encrypting a bench file 
-To encrypt a bench file simply run the main.py file with a file to encrypt, keys and k (NOTE: python, pyeda)
+To encrypt a bench file, simply run the main.py file with a file to encrypt, keys, and k (NOTE: python, PyEda need to be installed)
 - `python3 main.py "./src/benchmarks/iscas85/c17.bench" --key_values="3 4 5" --k=2`
 
 ## Testing algorithm
-To test the algorithm in a single file run the test_bench_file.sh using linux ( NOTE: NEOS, python, pyeda needs to be installed)
+To test the algorithm in a single file, run the test_bench_file.sh using Linux ( NOTE: NEOS, python, and PyEda need to be installed)
   - `./test_bench_file.sh ./benchmarks/iscas85/c17.bench --keys="3 4 5" --k=2`
 
-  This command will generate the encrypted file (run the python script motioned in 'Encrypting a bench file'), then runs NEOS with SAT solver
+  This command will generate the encrypted file (run the python script motioned in 'Encrypting a bench file'), then run NEOS with SAT solver.
 
 ### Testing a whole folder
-to perform a batch test run the `./test_folder.sh` file with the following positional 
+to perform a batch test, run the `./test_folder.sh` file with the following positional 
 - Folder path: Where are the files located
 - keys: keys to test with example "3 4 5"
   - Key1 = 3  or 011
