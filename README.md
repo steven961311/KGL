@@ -25,3 +25,17 @@ to perform a batch test, run the `./test_folder.sh` file with the following posi
 
 Example of a command:
 - `./test_folder.sh  ./benchmarks/iscas85  "5 5 5" 2`
+
+## Citation
+```
+@INPROCEEDINGS{KGL-Lock,
+  author={Lopez, Kevin and Rezaei, Amin},
+  booktitle={}, 
+  title={}, 
+  year={},
+  volume={},
+  number={},
+  pages={1-7},
+  doi={}
+  }
+
