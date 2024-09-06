@@ -77,8 +77,7 @@ Example of a command:
 @INPROCEEDINGS{KGL-Lock,
   author={Lopez, Kevin and Rezaei, Amin},
   booktitle={Proceedings of 30th Asia and South Pacific Design Automation Conference (ASP-DAC)}, 
-  title={K-Gate Lock: Multi-Key Logic Locking Using Input Encoding
-Against Oracle-Guided Attacks}, 
+  title={K-Gate Lock: Multi-Key Logic Locking Using Input Encoding Against Oracle-Guided Attacks}, 
   year={2025},
   volume={},
   number={},
