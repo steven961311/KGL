@@ -9,7 +9,7 @@ The file structure is organized as follows:
 - **Tools** - Tools used to test the algorithm:
   - **RANE** - Tool used to perform attacks on encrypted circuits.
   - **NEOS** - Tool used to perform attacks on encrypted circuits.
-  - **ABC** - Tool used to convert Verilog, BLIF, and bench files.
+  - **ABC** - Tool used to convert Verilog, BLIF, and BENCH files.
 
 - **src** - The source code for encrypting and testing the algorithm:
   - **test_runs** - Contains the previously run algorithms. The folder name matches the configuration run. 
@@ -33,7 +33,7 @@ The K-Gate Lock logic locking scheme secures digital circuits by adding gates th
 
 For a deeper explanation, refer to the [paper](www.www).
 
-## Running the algorithm
+## Running the Algorithm
 Before running any help script, ensure the following steps are completed:
 
 1. **Install Dependencies**:
@@ -50,17 +50,17 @@ Before running any help script, ensure the following steps are completed:
      cd <project_dir>/src/
      ```
 
-### Encrypting a bench file 
-To encrypt a bench file, simply run the main.py file with a file to encrypt, keys, and k (NOTE: python, PyEda need to be installed)
+### Encrypting a BENCH File 
+To encrypt a BENCH file, simply run the main.py file with a file to encrypt, keys, and k (NOTE: python, PyEda need to be installed)
 - `python3 main.py "./src/benchmarks/iscas85/c17.bench" --key_values="3 4 5" --k=2`
 
-### Testing algorithm
+### Testing Algorithm
 To test the algorithm in a single file, run the test_bench_file.sh using Linux ( NOTE: NEOS, python, and PyEda need to be installed)
   - `./test_bench_file.sh ./benchmarks/iscas85/c17.bench --keys="3 4 5" --k=2`
 
-  This command will generate the encrypted file (run the python script motioned in 'Encrypting a bench file'), then run NEOS with SAT solver.
+  This command will generate the encrypted file (run the python script motioned in 'Encrypting a BENCH file'), then run NEOS with SAT solver.
 
-#### Testing a whole folder
+#### Testing a Whole Folder
 to perform a batch test, run the `./test_folder.sh` file with the following positional 
 - Folder path: Where are the files located
 - keys: keys to test with example "3 4 5"
