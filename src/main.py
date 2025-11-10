@@ -104,7 +104,7 @@ if __name__ == "__main__":
         # print("m:\n", pformat(m), "\n")
         count += len(m)
         locking_info.append(f"  {gate} - {expr}")
-        logging.info(f"  {gate} - {expr}")
+        # logging.info(f"  {gate} - {expr}")
         if len(m) > 0:
             keys = list(m.keys())
             cur_gate_keys_except_last = {key: m[key] for key in keys[:-1]}

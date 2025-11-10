@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from multiprocessing import Pool, cpu_count
 from BenchParser import BenchParser
 from CreateEncryption import get_locked_circuit
 from utils.logic import convert_str_to_expr
@@ -41,6 +42,58 @@ def convert_exp_to_fn(
     return fn
 
 
+def _get_inputs_in_order(exp: Expression) -> tuple[List[str], List[Variable]]:
+    """Helper function to get inputs in order (needs to be at module level for pickling)"""
+    variables = exp.support
+    # Create a list to store the variables in order
+    ordered_variables = []
+    ordered_variables_str = []
+    # Iterate over the tokens in the expression
+    for token in variables:
+        # If the token is a variable and it is not already in the list, add it to the list
+        if token and token not in ordered_variables:
+            ordered_variables.append(token)
+            ordered_variables_str.append(token.name)
+    return ordered_variables_str, ordered_variables
+
+
+def _encrypt_single_gate(args: Tuple[str, str, List[int], int, int]) -> Tuple[str, str]:
+    """
+    Helper function to encrypt a single gate (needs to be at module level for multiprocessing)
+    
+    Parameters:
+    args: Tuple containing (gate_name, expr_str, key_values, max_key_bit_size, starting_key)
+    
+    Returns:
+    Tuple[str, str]: (gate_name, encrypted_expression_str)
+    """
+    gate, expr_str, key_values, max_key_bit_size, starting_key = args
+    
+    # Convert string back to expression
+    from pyeda.inter import expr as pyeda_expr
+    expr = pyeda_expr(expr_str)
+    
+    inps_str, inps_var = _get_inputs_in_order(expr)
+    key_names = [
+        "keyinput" + str(i + starting_key) for i in range(max_key_bit_size)
+    ]
+
+    fn = convert_exp_to_fn(expr, inps_var)
+
+    # Create the encrypted circuit
+    encrypted_circuit = get_locked_circuit(
+        inputs=inps_str,
+        outputs=[gate],
+        output_fns=[fn],
+        keys=key_names,
+        key_combinations=key_values,
+    )
+    
+    # Convert expression to string for return
+    encrypted_expr = list(encrypted_circuit.values())[0]
+    return (gate, str(encrypted_expr))
+
+
 class BenchEncryptor:
     def __init__(self, bench_file: str):
         self.bench_file = bench_file
@@ -50,17 +103,7 @@ class BenchEncryptor:
     def __get_inputs_in_order(
         self, exp: Expression
     ) -> tuple[List[str], List[Variable]]:
-        variables = exp.support
-        # Create a list to store the variables in order
-        ordered_variables = []
-        ordered_variables_str = []
-        # Iterate over the tokens in the expression
-        for token in variables:
-            # If the token is a variable and it is not already in the list, add it to the list
-            if token and token not in ordered_variables:
-                ordered_variables.append(token)
-                ordered_variables_str.append(token.name)
-        return ordered_variables_str, ordered_variables
+        return _get_inputs_in_order(exp)
 
     def get_encrypted_expression_for_bench(
         self, max_key_bit_size: int
@@ -132,6 +175,8 @@ class BenchEncryptor:
             )
             is not None
         }
+        logging.info(f"Number of gates to be processed: {len(expr_with_k_inputs)}")
+        logging.info(f"Number of key_values to be processed: {len(key_values)}")
         r = self.encrypt_gates(expr_with_k_inputs, key_values, max_key_bit_size)
         logging.info(
             f"Time taken to encrypt up to k inputs: {time.time() - start} seconds"
@@ -143,39 +188,44 @@ class BenchEncryptor:
         gates: dict[str, Expression],
         key_values: List[int],
         max_key_bit_size: int,
+        num_workers: int = 2,
     ) -> Dict[str, Expression]:
         """
-        This function encrypts the gates in the circuit.
+        This function encrypts the gates in the circuit using multiprocessing.
 
         Parameters:
-        bench_file (str): The path to the bench file.
+        gates: Dictionary of gate names and their expressions
+        key_values: List of key values to use for encryption
+        max_key_bit_size: Maximum key bit size
+        num_workers: Number of worker processes (default: 2)
 
         Returns:
-        Tuple[Dict[str, Expression], Dict[str, Expression]]: A tuple containing two dictionaries:
-                - The original boolean functions of the circuit. Expressions pyEda
-                - The second dictionary is the encrypted boolean functions of the encrypted circuit. Expressions pyEda
+        Dict[str, Expression]: Dictionary of encrypted expressions
         """
+        if len(gates) == 0:
+            return {}
+        
+        # Prepare arguments for each gate (convert Expression to string)
         starting_key = 0
-        encrypted_circuits: Dict[str, Expression] = {}
+        gate_args = []
         for gate, expr in gates.items():
-            inps_str, inps_var = self.__get_inputs_in_order(expr)
-            key_names = [
-                "keyinput" + str(i + starting_key) for i in range(max_key_bit_size)
-            ]
-
-            fn = convert_exp_to_fn(expr, inps_var)
-
-            # Create the encrypted circuit
-            encrypted_circuit = get_locked_circuit(
-                inputs=inps_str,
-                outputs=[gate],
-                output_fns=[fn],
-                keys=key_names,
-                key_combinations=key_values,
-            )
-            encrypted_circuits[gate] = list(encrypted_circuit.values())[0]
+            gate_args.append((gate, str(expr), key_values, max_key_bit_size, starting_key))
             starting_key += max_key_bit_size
-
+        
+        # Split work between workers
+        logging.info(f"Using {num_workers} workers to process {len(gates)} gates")
+        
+        encrypted_circuits: Dict[str, Expression] = {}
+        
+        # Use multiprocessing Pool
+        with Pool(processes=num_workers) as pool:
+            results = pool.map(_encrypt_single_gate, gate_args)
+        
+        # Collect results and convert string back to Expression
+        from pyeda.inter import expr as pyeda_expr
+        for gate_name, encrypted_expr_str in results:
+            encrypted_circuits[gate_name] = pyeda_expr(encrypted_expr_str)
+        
         return encrypted_circuits
 
 
@@ -197,7 +247,3 @@ if __name__ == "__main__":
 
     logging.debug(file_encryptor.encrypt_up_to_k_inputs(3))
     logging.debug("end \n\n")
-
-
-# {'G10gat': Or(And(~G1gat, ~G3gat, ~keyinput0, ~keyinput1, ~keyinput2, keyinput3), And(~G1gat, G3gat, ~keyinput0, ~keyinput1, keyinput2, keyinput3), And(G1gat, ~G3gat, ~keyinput0, ~keyinput1, keyinput2, ~keyinput3))}
-# {'G10gat': Or(And(~G1gat, ~G3gat, ~keyinput0, ~keyinput1, ~keyinput2, keyinput3), And(~G1gat, G3gat, ~keyinput0, ~keyinput1, keyinput2, keyinput3), And(G1gat, ~G3gat, ~keyinput0, ~keyinput1, keyinput2, ~keyinput3))}
