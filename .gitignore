@@ -2,3 +2,10 @@ Tools/
 __pycache__/
 src/benchmarks/
 src/allpy.txt
+src/BenchKeyGen_new.py
+src/BenchKeyGen_old.py
+src/CreateEncryption_old.py
+src/*.sh
+src/veri.py
+src/verify.py
+venv/

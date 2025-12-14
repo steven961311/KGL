@@ -1,220 +1,363 @@
+# Path: src/CreateEncryption.py
+
+import os
+import re
+import ast
+import tempfile
+import subprocess
 import logging
-import time
-from typing import Callable, Dict, List
-from pyeda.inter import (
-    exprvar,
-    Or,
-    And,
-    Not,
-    Nand,
-    expr2truthtable,
-    truthtable2expr,
-    espresso_tts,
-    espresso_exprs,
-)
-from utils.logic import generate_input_logic_table
-from pyeda.boolalg.table import truthtable
-from pyeda.boolalg.expr import Expression
-from pprint import pprint
+from typing import Dict, List
+from functools import reduce
+
+import numpy as np
+
+# --- Paths / temp dir (must exist at module top-level for multiprocessing workers) ---
+CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+ABC_PATH = os.path.abspath(os.path.join(CURRENT_DIR, "../Tools/abc/abc"))
+TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") else None
+
+_UINT64_ALL1 = np.uint64(0xFFFFFFFFFFFFFFFF)
+
+# ---- Small per-process caches (help a lot when many gates share same fanin) ----
+_BITSLICED_INPUTS_CACHE: Dict[int, List[np.ndarray]] = {}
 
 
-def get_locked_circuit(
-    inputs: List[str],  # contains the names of the inputs x
-    outputs: List[str],  # contains the names of the outputs y
-    output_fns: List[Callable],  # contains the output functions
-    keys: List[str],  # contains the names of the keys. Example  k1, k2 , k3
-    key_combinations: List[int],  # contains the key combinations made up of keys
-) -> Dict[str, Expression]:
+def _parse_bench_to_pyeda_string(bench_content: str) -> Dict[str, str]:
     """
-    This function creates a locked (encrypted) circuit based on the provided inputs, outputs, output functions, keys, and key combinations.
-
-    Parameters:
-    inputs (List[str]): A list of strings representing the names of the inputs to the circuit.
-    outputs (List[str]): A list of strings representing the names of the outputs from the circuit.
-    output_fns (List[Callable]): A list of functions that compute the outputs based on the inputs.
-    keys (List[str]): A list of strings representing the names of the keys used for encryption.
-    key_combinations (List[int]): A list of integers representing the combinations of keys used for encryption.
-
-    Returns:
-    Dict[str, Expression]: A dictionary mapping from output names to their corresponding encrypted expressions.
+    Parse ABC .bench into {output_wire_name: expanded_expr_str}.
+    Supports multiple OUTPUTs.
+    Supports basic gates + 2-input LUTs.
     """
-    logging.debug("locking circuit")
-    logging.debug(f"inputs: {inputs},     outputs ={outputs}")
-    start = time.time()
-    # 1. generate the logic table for the original circuit ( transition table)
-    transition_table = generate_input_logic_table(len(inputs))
-    # generate what every output should be and append it ot the transition table
-    for row in transition_table:
-        for output_fn in output_fns:
-            row.append(output_fn(*row))
-    # pprint.pprint(transition_table)
-    # 2. add the key to the logic table
-    for i, row in enumerate(transition_table):
-        # current key is made up of the current key combination and made up with the keys
-        current_key = key_combinations[i % len(key_combinations)]
-        # make the combination of the key bits
-        key_bits = [
-            int(x) for x in format(current_key, f"0{len(keys)}b")
-        ]  # convert the key to binary
+    lines = bench_content.splitlines()
+    definitions: Dict[str, str] = {}
+    output_wires: List[str] = []
 
-        # add key bits to the beginning of the row
-        transition_table[i] = key_bits + row
+    output_pattern = re.compile(r"^\s*OUTPUT\((.+?)\)\s*$")
+    gate_pattern = re.compile(r"^\s*(\w+)\s*=\s*(.+?)\((.+?)\)\s*$")
 
-    # add the logic for incorrect keys and output should be o.
-    # when the key is incorrect the output should be 1
-    # for i, row in enumerate(transition_table):
-    #     current_key = key_combinations[i % len(key_combinations)]
-    #     for key_ in key_combinations:
-    #         # if output should be 0
-    #         if key_ != current_key and row[-1] == 0:
-    #             key_bits = [
-    #                 int(x) for x in format(key_, f"0{len(keys)}b")
-    #             ]  # convert the key to binary
-    #             transition_table.append(
-    #                 key_bits + row[: -len(outputs)] + [1] * len(outputs) # ! assuming only one output
-    #             )
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
 
-    # logging.debug("state transition table")
-    # pprint(transition_table)
-    pyeda_vars = {var: exprvar(var) for var in keys + inputs + outputs}
+        m = output_pattern.match(line)
+        if m:
+            output_wires.append(m.group(1).strip())
+            continue
 
-    # Initialize Boolean functions for each output
-    bool_funcs: Dict[str, Expression] = {output: Or() for output in outputs}
-    # Build Boolean expressions from the transition table
-    for row in transition_table:
-        condition = And(
-            *[
-                pyeda_vars[inp] if val else ~pyeda_vars[inp]
-                for inp, val in zip(keys + inputs, row[: -len(outputs)])
-            ]
-        )
-        for output, val in zip(outputs, row[-len(outputs) :]):
-            if val:  #
-                bool_funcs[output] |= condition
+        if line.startswith("INPUT"):
+            continue
 
-    # Simplify the Boolean expressions
-    logging.debug(f"Time taken: {time.time() - start} seconds\n")
-    simplified_funcs = {output: func.simplify() for output, func in bool_funcs.items()}
-    # Print the simplified Boolean functions
-    # for output, func in simplified_funcs.items():
-    #     logging.debug(f"\n\n{output}: {func}")
+        m = gate_pattern.match(line)
+        if not m:
+            continue
 
-    return simplified_funcs
+        wire_name, gate_type_raw, inputs_str = m.groups()
+        gt = gate_type_raw.strip().upper()
+        inputs = [x.strip() for x in inputs_str.split(",")]
+
+        if "NOT" in gt:
+            expr_str = f"Not({inputs[0]})"
+        elif "BUF" in gt:
+            expr_str = f"Buf({inputs[0]})"
+        elif "AND" in gt and "NAND" not in gt:
+            expr_str = f"And({', '.join(inputs)})"
+        elif "NAND" in gt:
+            expr_str = f"Nand({', '.join(inputs)})"
+        elif "OR" in gt and "NOR" not in gt and "XOR" not in gt:
+            expr_str = f"Or({', '.join(inputs)})"
+        elif "NOR" in gt:
+            expr_str = f"Nor({', '.join(inputs)})"
+        elif "XOR" in gt:
+            expr_str = f"Xor({', '.join(inputs)})"
+        elif "LUT" in gt:
+            # 2-input LUT only
+            try:
+                hex_str = gt.split()[-1]
+                val = int(hex_str, 16)
+                mt = []
+                if (val >> 0) & 1:
+                    mt.append(f"And(Not({inputs[0]}), Not({inputs[1]}))")
+                if (val >> 1) & 1:
+                    mt.append(f"And({inputs[0]}, Not({inputs[1]}))")
+                if (val >> 2) & 1:
+                    mt.append(f"And(Not({inputs[0]}), {inputs[1]})")
+                if (val >> 3) & 1:
+                    # FIX: removed extra ')'
+                    mt.append(f"And({inputs[0]}, {inputs[1]})")
+
+                if not mt:
+                    expr_str = "0"
+                elif len(mt) == 1:
+                    expr_str = mt[0]
+                elif len(mt) == 4:
+                    expr_str = "1"
+                else:
+                    expr_str = f"Or({', '.join(mt)})"
+            except Exception as e:
+                logging.error(f"Failed to parse LUT '{gt}': {e}")
+                expr_str = f"And({', '.join(inputs)})"
+        else:
+            logging.error(f"Unknown gate type '{gate_type_raw}'. Defaulting to And.")
+            expr_str = f"And({', '.join(inputs)})"
+
+        definitions[wire_name] = expr_str
+
+    # expand DAG into expressions (text substitution)
+    temp_wires = sorted(definitions.keys(), key=len, reverse=True)
+    out_exprs: Dict[str, str] = {}
+
+    for ow in output_wires:
+        if ow not in definitions:
+            out_exprs[ow] = "0"
+            continue
+
+        final_str = definitions[ow]
+        for _ in range(30):
+            changed = False
+            for w in temp_wires:
+                if w == ow:
+                    continue
+                pat = r"\b" + re.escape(w) + r"\b"
+                if re.search(pat, final_str):
+                    final_str = re.sub(pat, definitions[w], final_str)
+                    changed = True
+            if not changed:
+                break
+
+        out_exprs[ow] = final_str
+
+    return out_exprs
 
 
-if __name__ == "__main__":
-    #
-    #     exp = get_locked_circuit(
-    #         inputs=["A", "B"],
-    #         outputs=["Y"],
-    #         output_fns=[lambda A, B: A | B],
-    #         keys=["k1", "k2"],
-    #         key_combinations=[1, 3],
-    #     )["Y"]
-    #
-    #     logging.debug(str(espresso_exprs(exp)))
-    #
-    #     exp = get_locked_circuit(
-    #         inputs=["A", "B"],
-    #         outputs=["Y"],
-    #         output_fns=[lambda A, B: A ^ B],
-    #         keys=["k1", "k2"],
-    #         key_combinations=[1, 0, 3, 1],
-    #     )["Y"]
-    #
-    #     logging.debug(str(espresso_exprs(exp)))
-
-    #     A, B, k1, k2 = map(exprvar, ["A", "B", "k1", "k2"])
-    #     point = {
-    #         A: 0,
-    #         B: 0,
-    #         k1: 0,
-    #         k2: 1,
-    #     }
-    #
-    #     logging.debug(exp.restrict(point))
-    #     tt = expr2truthtable(exp)
-    #     logging.debug(tt)
-    #     expression = truthtable2expr(tt)
-    #     logging.debug(expression.simplify())
-
-    """C17
-    G22gat = nand(nand(G1gat, G3gat), nand(G2gat, nand(G3gat, G6gat)))
-    G23gat = nand(nand(G2gat, nand(G3gat, G6gat)), nand(nand(G3gat, G6gat), G7gat))
+def _make_bitsliced_inputs(num_inputs: int) -> List[np.ndarray]:
     """
+    Cached bitsliced patterns with the same order as:
+      row i -> [(i>>(n-1-j))&1 for j in 0..n-1]
+    Returns: list of uint64 arrays, each array shape (W,)
+    """
+    cached = _BITSLICED_INPUTS_CACHE.get(num_inputs)
+    if cached is not None:
+        return cached
 
-    class C17:
-        @staticmethod
-        def G22gat(G1gat_, G2gat_, G3gat_, G6gat_):
-            G1gat, G2gat, G3gat, G6gat = map(
-                exprvar, ["G1gat", "G2gat", "G3gat", "G6gat"]
-            )
-            point = {
-                G1gat: G1gat_,
-                G2gat: G2gat_,
-                G3gat: G3gat_,
-                G6gat: G6gat_,
-            }
-            expr = Nand(Nand(G1gat, G3gat), Nand(G2gat, Nand(G3gat, G6gat)))
-            return int(expr.restrict(point))
+    if num_inputs <= 0:
+        _BITSLICED_INPUTS_CACHE[num_inputs] = []
+        return []
 
-        @staticmethod
-        def G23gat(G2gat_, G3gat_, G6gat_, G7gat_):
-            G2gat, G3gat, G6gat, G7gat = map(
-                exprvar, ["G2gat", "G3gat", "G6gat", "G7gat"]
-            )
-            point = {
-                G2gat: G2gat_,
-                G3gat: G3gat_,
-                G6gat: G6gat_,
-                G7gat: G7gat_,
-            }
-            expr = Nand(
-                Nand(G2gat, Nand(G3gat, G6gat)), Nand(Nand(G3gat, G6gat), G7gat)
-            )
-            return int(expr.restrict(point))
+    R = 1 << num_inputs
+    W = (R + 63) // 64
 
-    G22gat = get_locked_circuit(
-        inputs=["G1gat", "G2gat", "G3gat", "G6gat"],
-        outputs=["G22gat"],
-        output_fns=[C17.G22gat],
-        keys=["k1", "k2"],
-        key_combinations=[1, 3],
-    )["G22gat"]
-    logging.debug(f"G22gat: { espresso_exprs(G22gat) }\n")
-    # G22gat: (Or(And(G1gat, G3gat, ~G6gat, ~k1, k2), And(G1gat, G3gat, G6gat, k1, k2), And(G2gat, ~G3gat, G6gat, k1, k2), And(G2gat, ~G6gat, ~k1, k2)),)
+    idx = np.arange(W * 64, dtype=np.uint64).reshape(W, 64)
+    bitpos = np.arange(64, dtype=np.uint64)
+    mask = (np.uint64(1) << bitpos).reshape(1, 64)
 
-    G23gat = get_locked_circuit(
-        inputs=["G2gat", "G3gat", "G6gat", "G7gat"],
-        outputs=["G23gat"],
-        output_fns=[C17.G23gat],
-        keys=["k1", "k2"],
-        key_combinations=[1, 3],
-    )["G23gat"]
-    logging.debug(f"G23gat: { espresso_exprs(G23gat) }\n")
-    # G23gat: (Or(And(G2gat, ~G6gat, ~k1, k2, ~G7gat), And(~G3gat, k1, k2, G7gat), And(G2gat, ~G3gat, ~k1, k2, ~G7gat), And(~G6gat, k1, k2, G7gat)),)
-    logging.debug("Done")
+    words = []
+    for j in range(num_inputs):
+        shift = np.uint64(num_inputs - 1 - j)
+        bits = (idx >> shift) & np.uint64(1)        # (W,64)
+        w = (bits * mask).sum(axis=1).astype(np.uint64)
+        words.append(w)
 
-    # G223gat: Not(And(Not(And(~G1gat, G4gat)), Not(And(~G11gat, G17gat)), Not(And(~G24gat, G30gat)), Not(And(~G37gat, G43gat)), Not(And(~G50gat, G56gat)), Not(And(~G63gat, G69gat)), Not(And(~G76gat, G82gat)), Not(And(~G89gat, G95gat)), Not(And(~G102gat, G108gat))))
-    # fmt: off
-    class c432:
-        @staticmethod
-        def G223gat(   G1gat_, G4gat_, G11gat_, G17gat_, G24gat_, G30gat_, G37gat_, G43gat_, G50gat_, G56gat_, G63gat_, G69gat_, G76gat_, G82gat_, G89gat_, G95gat_, G102gat_, G108gat_, ):
-            (
-             G1gat, G4gat, G11gat, G17gat, G24gat, G30gat, G37gat, G43gat, G50gat, G56gat, G63gat, G69gat, G76gat, G82gat, G89gat, G95gat, G102gat, G108gat,
-            ) = map( exprvar, [ "G1gat", "G4gat", "G11gat", "G17gat", "G24gat", "G30gat", "G37gat", "G43gat", "G50gat", "G56gat", "G63gat", "G69gat", "G76gat", "G82gat", "G89gat", "G95gat", "G102gat", "G108gat" ], )
-            point = { G1gat: G1gat_, G4gat: G4gat_, G11gat: G11gat_, G17gat: G17gat_, G24gat: G24gat_, G30gat: G30gat_, G37gat: G37gat_, G43gat: G43gat_, G50gat: G50gat_, G56gat: G56gat_, G63gat: G63gat_, G69gat: G69gat_, G76gat: G76gat_, G82gat: G82gat_, G89gat: G89gat_, G95gat: G95gat_, G102gat: G102gat_, G108gat: G108gat_,}
-            expr = Nand( Nand( G1gat, G4gat, ), Nand( G11gat, G17gat, ), Nand( G24gat, G30gat, ), Nand( G37gat, G43gat, ), Nand( G50gat, G56gat, ), Nand( G63gat, G69gat, ), Nand( G76gat, G82gat, ), Nand( G89gat, G95gat, ), Nand( G102gat, G108gat, ))
-            return int(expr.restrict(point))
+    _BITSLICED_INPUTS_CACHE[num_inputs] = words
+    return words
 
-    G223gat = get_locked_circuit(
-        inputs=[ "G1gat", "G4gat", "G11gat", "G17gat", "G24gat", "G30gat", "G37gat", "G43gat", "G50gat", "G56gat", "G63gat", "G69gat", "G76gat", "G82gat", "G89gat", "G95gat", "G102gat", "G108gat"],
-        outputs=["G223gat"],
-        output_fns=[c432.G223gat],
-        keys=["k1", "k2"],
-        key_combinations=[1, 3],
-    )["G223gat"]
-    logging.debug("Done 1 ")
-    logging.debug(f"G223gat: { G223gat }")
-    # fmt: one
-    logging.debug('Done')
+
+class _BitsliceExprEvaluator:
+    __slots__ = ("env", "W")
+
+    def __init__(self, env: Dict[str, np.ndarray], W: int):
+        self.env = env
+        self.W = W
+
+    def _const(self, v):
+        if v is True or v == 1:
+            return np.full(self.W, _UINT64_ALL1, dtype=np.uint64)
+        if v is False or v == 0:
+            return np.zeros(self.W, dtype=np.uint64)
+        raise TypeError(f"Unsupported constant: {v!r}")
+
+    def eval(self, expr_str: str) -> np.ndarray:
+        node = ast.parse(expr_str, mode="eval").body
+        return self._eval(node)
+
+    def _eval(self, node) -> np.ndarray:
+        if isinstance(node, ast.Name):
+            return self.env[node.id]
+
+        if isinstance(node, ast.Constant):
+            return self._const(node.value)
+
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            return ~self._eval(node.operand)
+
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only simple function calls allowed")
+            fn = node.func.id
+            args = [self._eval(a) for a in node.args]
+
+            if fn == "Not":
+                return ~args[0]
+            if fn == "Buf":
+                return args[0]
+            if fn == "And":
+                return reduce(lambda x, y: x & y, args, np.full(self.W, _UINT64_ALL1, dtype=np.uint64))
+            if fn == "Or":
+                return reduce(lambda x, y: x | y, args, np.zeros(self.W, dtype=np.uint64))
+            if fn == "Xor":
+                return reduce(lambda x, y: x ^ y, args, np.zeros(self.W, dtype=np.uint64))
+            if fn == "Nand":
+                a = reduce(lambda x, y: x & y, args, np.full(self.W, _UINT64_ALL1, dtype=np.uint64))
+                return ~a
+            if fn == "Nor":
+                a = reduce(lambda x, y: x | y, args, np.zeros(self.W, dtype=np.uint64))
+                return ~a
+
+            raise ValueError(f"Unsupported function: {fn}")
+
+        raise ValueError(f"Unsupported AST node: {type(node).__name__}")
+
+
+def get_locked_circuit_bitslice(
+    inputs: List[str],
+    outputs: List[str],
+    expr_strs: List[str],
+    keys: List[str],
+    key_combinations: List[int],
+) -> Dict[str, str]:
+    """
+    Fast: bitslicing evaluate outputs (no restrict), then PLA->ABC->bench->expr-string.
+    Keeps original semantics: key assigned per-row using i % len(key_combinations).
+    """
+    if not os.path.exists(ABC_PATH):
+        raise FileNotFoundError(f"ABC binary not found at: {ABC_PATH}")
+    if len(outputs) != len(expr_strs):
+        raise ValueError("outputs and expr_strs must have the same length")
+    if not key_combinations:
+        raise ValueError("key_combinations cannot be empty")
+
+    n_in = len(inputs)
+    R = 1 << n_in
+    W = (R + 63) // 64
+
+    # bitslice inputs (cached by n_in)
+    in_words = _make_bitsliced_inputs(n_in)
+    env = {name: w for name, w in zip(inputs, in_words)}
+
+    # eval outputs
+    ev = _BitsliceExprEvaluator(env, W)
+    out_words_list = []
+    for s in expr_strs:
+        s = s.strip()
+        if s == "0":
+            out_words_list.append(np.zeros(W, dtype=np.uint64))
+        elif s == "1":
+            out_words_list.append(np.full(W, _UINT64_ALL1, dtype=np.uint64))
+        else:
+            out_words_list.append(ev.eval(s))
+
+    # precompute key strings
+    num_keys = len(keys)
+    total_inputs_count = num_keys + n_in
+    key_strs = [format(k, f"0{num_keys}b") for k in key_combinations]
+    K = len(key_combinations)
+
+    # stream-write PLA (no giant truth table)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".pla", delete=False, dir=TEMP_DIR) as tmp_pla:
+        tmp_pla_path = tmp_pla.name
+        tmp_pla.write(f".i {total_inputs_count}\n")
+        tmp_pla.write(f".o {len(outputs)}\n")
+        tmp_pla.write(f".ilb {' '.join(keys + inputs)}\n")
+        tmp_pla.write(f".ob {' '.join(outputs)}\n")
+
+        buf = []
+        BUF_FLUSH = 8192
+        has_any_true = False
+
+        for w in range(W):
+            ow = [out_words_list[j][w] for j in range(len(outputs))]
+            if all(x == 0 for x in ow):
+                continue
+
+            base = w * 64
+            for b in range(64):
+                i = base + b
+                if i >= R:
+                    break
+
+                out_bits = []
+                any1 = False
+                shiftb = np.uint64(b)
+                for j in range(len(outputs)):
+                    bit = (ow[j] >> shiftb) & np.uint64(1)
+                    if bit:
+                        any1 = True
+                        out_bits.append("1")
+                    else:
+                        out_bits.append("0")
+
+                if not any1:
+                    continue
+
+                has_any_true = True
+                kstr = key_strs[i % K]
+                istr = format(i, f"0{n_in}b")
+                buf.append(f"{kstr}{istr} {''.join(out_bits)}\n")
+                if len(buf) >= BUF_FLUSH:
+                    tmp_pla.writelines(buf)
+                    buf.clear()
+
+        if buf:
+            tmp_pla.writelines(buf)
+
+        tmp_pla.write(".e\n")
+
+    if not has_any_true:
+        try:
+            os.remove(tmp_pla_path)
+        except OSError:
+            pass
+        return {out: "0" for out in outputs}
+
+    tmp_bench_path = tmp_pla_path.replace(".pla", ".bench")
+
+    try:
+        abc_cmd = f"read_pla {tmp_pla_path}; strash; write_bench {tmp_bench_path}"
+        subprocess.run([ABC_PATH, "-c", abc_cmd], check=True, capture_output=True, text=True)
+
+        if not os.path.exists(tmp_bench_path):
+            logging.error(f"ABC output missing: {tmp_bench_path}")
+            return {out: "0" for out in outputs}
+
+        with open(tmp_bench_path, "r") as f:
+            bench_data = f.read()
+
+        raw_out_exprs_by_wire = _parse_bench_to_pyeda_string(bench_data)
+
+        # map by name first, fallback by OUTPUT order
+        out_order = []
+        for line in bench_data.splitlines():
+            m = re.match(r"^\s*OUTPUT\((.+?)\)\s*$", line.strip())
+            if m:
+                out_order.append(m.group(1).strip())
+
+        result = {}
+        for idx, out in enumerate(outputs):
+            if out in raw_out_exprs_by_wire:
+                result[out] = raw_out_exprs_by_wire[out]
+            elif idx < len(out_order):
+                result[out] = raw_out_exprs_by_wire.get(out_order[idx], "0")
+            else:
+                result[out] = "0"
+
+        return result
+
+    finally:
+        try:
+            os.remove(tmp_pla_path)
+        except OSError:
+            pass
+        try:
+            os.remove(tmp_bench_path)
+        except OSError:
+            pass
