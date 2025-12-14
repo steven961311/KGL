@@ -1,13 +1,3 @@
-# Path: src/BenchKeyGen.py
-"""
-Encrypt selected gates in a BENCH circuit using CreateEncryption.get_locked_circuit_bitslice.
-
-Optimizations:
-- uint64 bitslicing inside CreateEncryption (no per-row PyEDA restrict)
-- Parse returned Or(And(...), ...) strings with safe eval (NOT pyeda_expr parser)
-- Multiprocessing with fork + shared registry (COW) to avoid pickling large Expression objects
-"""
-
 import logging
 import os
 import time
@@ -22,18 +12,11 @@ from BenchParser import BenchParser
 from CreateEncryption import get_locked_circuit_bitslice
 from utils.logic import convert_str_to_expr
 
-# -----------------------
-# Fork+COW shared registry
-# -----------------------
 _GATE_REGISTRY: Dict[str, Expression] = {}
-_GET_LOCKED = None  # set in _worker_init
+_GET_LOCKED = None 
 
 
 def _worker_init(get_locked_ref):
-    """
-    Runs in each child process after fork.
-    Set a module-level reference to avoid re-import overhead.
-    """
     global _GET_LOCKED
     _GET_LOCKED = get_locked_ref
 
@@ -45,13 +28,6 @@ def _get_inputs_in_order(exp: Expression) -> tuple[List[str], List[Variable]]:
 
 
 def parse_pyeda_funcstyle(expr_str: str) -> Expression:
-    """
-    Parse strings like:
-      Or(And(a, Not(b)), Nand(c, d))
-    into a PyEDA Expression.
-
-    IMPORTANT: Do NOT use pyeda.inter.expr() for this format.
-    """
     allowed_fns = {
         "And": And,
         "Or": Or,
@@ -82,10 +58,6 @@ def parse_pyeda_funcstyle(expr_str: str) -> Expression:
 
 
 def _encrypt_single_gate(args) -> Tuple[str, str]:
-    """
-    Worker encrypts one gate and returns (gate_name, encrypted_expr_str).
-    Uses _GATE_REGISTRY inherited via fork (COW).
-    """
     gate_name, key_values, max_key_bit_size, starting_key = args
 
     expr = _GATE_REGISTRY.get(gate_name)
@@ -185,10 +157,8 @@ class BenchEncryptor:
 
         if not num_workers or num_workers <= 0:
             cpu = multiprocessing.cpu_count()
-            # ABC + python overhead: too many workers can slow down
             num_workers = min(max(1, min(cpu, 16)), len(gates))
 
-        # Populate registry BEFORE creating Pool so children inherit via fork (COW)
         global _GATE_REGISTRY
         _GATE_REGISTRY = {}
         for gate, expr in gates.items():

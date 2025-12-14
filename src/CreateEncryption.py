@@ -1,4 +1,3 @@
-# Path: src/CreateEncryption.py
 
 import os
 import re
@@ -11,23 +10,16 @@ from functools import reduce
 
 import numpy as np
 
-# --- Paths / temp dir (must exist at module top-level for multiprocessing workers) ---
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
 ABC_PATH = os.path.abspath(os.path.join(CURRENT_DIR, "../Tools/abc/abc"))
 TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") else None
 
 _UINT64_ALL1 = np.uint64(0xFFFFFFFFFFFFFFFF)
 
-# ---- Small per-process caches (help a lot when many gates share same fanin) ----
 _BITSLICED_INPUTS_CACHE: Dict[int, List[np.ndarray]] = {}
 
 
 def _parse_bench_to_pyeda_string(bench_content: str) -> Dict[str, str]:
-    """
-    Parse ABC .bench into {output_wire_name: expanded_expr_str}.
-    Supports multiple OUTPUTs.
-    Supports basic gates + 2-input LUTs.
-    """
     lines = bench_content.splitlines()
     definitions: Dict[str, str] = {}
     output_wires: List[str] = []
@@ -71,7 +63,6 @@ def _parse_bench_to_pyeda_string(bench_content: str) -> Dict[str, str]:
         elif "XOR" in gt:
             expr_str = f"Xor({', '.join(inputs)})"
         elif "LUT" in gt:
-            # 2-input LUT only
             try:
                 hex_str = gt.split()[-1]
                 val = int(hex_str, 16)
@@ -83,7 +74,6 @@ def _parse_bench_to_pyeda_string(bench_content: str) -> Dict[str, str]:
                 if (val >> 2) & 1:
                     mt.append(f"And(Not({inputs[0]}), {inputs[1]})")
                 if (val >> 3) & 1:
-                    # FIX: removed extra ')'
                     mt.append(f"And({inputs[0]}, {inputs[1]})")
 
                 if not mt:
@@ -103,7 +93,6 @@ def _parse_bench_to_pyeda_string(bench_content: str) -> Dict[str, str]:
 
         definitions[wire_name] = expr_str
 
-    # expand DAG into expressions (text substitution)
     temp_wires = sorted(definitions.keys(), key=len, reverse=True)
     out_exprs: Dict[str, str] = {}
 
@@ -131,11 +120,6 @@ def _parse_bench_to_pyeda_string(bench_content: str) -> Dict[str, str]:
 
 
 def _make_bitsliced_inputs(num_inputs: int) -> List[np.ndarray]:
-    """
-    Cached bitsliced patterns with the same order as:
-      row i -> [(i>>(n-1-j))&1 for j in 0..n-1]
-    Returns: list of uint64 arrays, each array shape (W,)
-    """
     cached = _BITSLICED_INPUTS_CACHE.get(num_inputs)
     if cached is not None:
         return cached
@@ -225,10 +209,6 @@ def get_locked_circuit_bitslice(
     keys: List[str],
     key_combinations: List[int],
 ) -> Dict[str, str]:
-    """
-    Fast: bitslicing evaluate outputs (no restrict), then PLA->ABC->bench->expr-string.
-    Keeps original semantics: key assigned per-row using i % len(key_combinations).
-    """
     if not os.path.exists(ABC_PATH):
         raise FileNotFoundError(f"ABC binary not found at: {ABC_PATH}")
     if len(outputs) != len(expr_strs):
@@ -240,11 +220,9 @@ def get_locked_circuit_bitslice(
     R = 1 << n_in
     W = (R + 63) // 64
 
-    # bitslice inputs (cached by n_in)
     in_words = _make_bitsliced_inputs(n_in)
     env = {name: w for name, w in zip(inputs, in_words)}
 
-    # eval outputs
     ev = _BitsliceExprEvaluator(env, W)
     out_words_list = []
     for s in expr_strs:
@@ -256,13 +234,11 @@ def get_locked_circuit_bitslice(
         else:
             out_words_list.append(ev.eval(s))
 
-    # precompute key strings
     num_keys = len(keys)
     total_inputs_count = num_keys + n_in
     key_strs = [format(k, f"0{num_keys}b") for k in key_combinations]
     K = len(key_combinations)
 
-    # stream-write PLA (no giant truth table)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".pla", delete=False, dir=TEMP_DIR) as tmp_pla:
         tmp_pla_path = tmp_pla.name
         tmp_pla.write(f".i {total_inputs_count}\n")
@@ -334,7 +310,6 @@ def get_locked_circuit_bitslice(
 
         raw_out_exprs_by_wire = _parse_bench_to_pyeda_string(bench_data)
 
-        # map by name first, fallback by OUTPUT order
         out_order = []
         for line in bench_data.splitlines():
             m = re.match(r"^\s*OUTPUT\((.+?)\)\s*$", line.strip())
